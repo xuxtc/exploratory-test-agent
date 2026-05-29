@@ -1,54 +1,30 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
-  "enabledMcpjsonServers": [
-    "linear",
-    "chrome-devtools",
-    "github"
-  ],
-  "permissions": {
-    "allow": [
-      "mcp__linear__*",
-      "mcp__chrome-devtools__*",
-      "mcp__github__*",
-      "Read($CLAUDE_PROJECT_DIR/**)",
-      "Write($CLAUDE_PROJECT_DIR/**)",
-      "Edit($CLAUDE_PROJECT_DIR/**)",
-      "Bash($CLAUDE_PROJECT_DIR/scripts/*.sh:*)",
-      "Bash($CLAUDE_PROJECT_DIR/scripts/*.py:*)",
-      "Bash(ls:*)",
-      "Bash(cat:*)",
-      "Bash(jq:*)",
-      "Bash(mkdir:*)",
-      "Bash(date:*)",
-      "Bash(git:*)",
-      "Bash(grep:*)",
-      "Bash(find:*)",
-      "Bash(rg:*)",
-      "Bash(head:*)",
-      "Bash(tail:*)",
-      "Bash(wc:*)",
-      "Bash(file:*)",
-      "Bash(which:*)",
-      "Bash(stat:*)",
-      "Bash(echo:*)",
-      "Bash(pwd:*)",
-      "Bash(sed:*)",
-      "Bash(awk:*)",
-      "Bash(python3:*)",
-      "Bash(chmod:*)",
-      "Bash(cp:*)",
-      "Bash(mv:*)",
-      "Bash(touch:*)",
-      "Bash(npx playwright test:*)",
-      "Bash(npm test:*)",
-      "Bash(rm:*)"
-    ],
-    "ask": [
-      "Bash(git push:*)",
-      "Write($PLAYWRIGHT_REPO_PATH/**)"
-    ]
-  },
   "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "mcp__chrome-devtools__|mcp__linear__|mcp__github__",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/timing-hook-pre.sh\"",
+            "async": true
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "mcp__chrome-devtools__|mcp__linear__|mcp__github__",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/timing-hook-post.sh\"",
+            "async": true
+          }
+        ]
+      }
+    ],
     "SessionStart": [
       {
         "matcher": "*",
@@ -71,6 +47,5 @@
         ]
       }
     ]
-  },
-  "env": {}
+  }
 }

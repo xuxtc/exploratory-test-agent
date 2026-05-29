@@ -18,7 +18,7 @@ Earlier runs of `/test-tickets` discovered the test-data shape after the spec wa
 - `artifacts/<run-id>/02-triage.json` — the test units the triage agent grouped.
 - `fixtures/manifest.json` — index of available fixture files with `covers_event_types` annotations.
 - The run-id.
-- Each ticket's PR diffs via `mcp__github__get_pull_request_files` — same source the strategist uses.
+- `artifacts/<run-id>/01-pr-diffs.json` — PR diff cache written by `linear-fetcher`. Read this instead of re-fetching from GitHub.
 
 ## Output
 
@@ -28,12 +28,26 @@ Earlier runs of `/test-tickets` discovered the test-data shape after the spec wa
 
 ### Default fresh case
 
-For every test unit in `02-triage.json`, the default `case_decision` is `create_fresh`. Reuse an existing case only when:
+For every test unit in `02-triage.json`, the default `case_decision` is `create_fresh`. Reuse an existing case only when one of the three exits below applies. **Each exit carries a confidence level** — high-confidence decisions are made autonomously; medium/low decisions surface a question to the user before proceeding.
 
-1. **The user or ticket explicitly names a case-id** (e.g. ticket says "see case 8213537" or the user passed `--case-id <N>` to /test-tickets). Record the source under `reuse_reason`.
-2. **The PR is purely UI / route / visibility-toggle and has zero data preconditions.** A change like "rename a button" or "fix a CSS layout on a static page" can run on any compatible existing case. Use this exit only when the PR diff is unambiguously data-free — when in doubt, default to fresh.
+1. **The user or ticket explicitly names a case-id** (e.g. ticket says "see case 8213537" or the user passed `--case-id <N>` to /test-tickets). → `confidence: high`, decide autonomously. Record the source under `reuse_reason`.
 
-Both exits require explicit reasoning in `reuse_reason`. Anything else, fresh.
+2. **The PR is purely UI / route / visibility-toggle and has zero data preconditions.** A change like "rename a button" or "fix a CSS layout on a static page" can run on any compatible existing case. → `confidence: high` when the diff is unambiguously data-free (only `.css`, route wiring, JSX restructuring); `confidence: medium` when the diff has both styling and minor logic changes. High → decide autonomously. Medium → surface to user.
+
+3. **The ticket and PR contain no case data requirements.** Ask: "Does the ticket or PR description mention a specific case state, event type, connector, extraction status, case kind, or any other case-level property that the test needs?" Apply the confidence rules below, then act accordingly.
+
+   **Confidence rules for exit 3:**
+
+   | Signal | Confidence | Action |
+   |--------|-----------|--------|
+   | PR diff is entirely within agent tool files (`tools/email/`, `tools/task/`, `tools/note/`, `tools/connector/`) AND neither ticket nor PR description mentions any case data property | **high** | Decide `reuse_existing` autonomously |
+   | PR diff is entirely within agent tool files BUT ticket/PR description mentions a case property ambiguously (e.g. "test on a case with activity") | **medium** | Surface to user: "This looks like a case-agnostic change — I'm planning to reuse an existing deqtest_ case. Does that work, or do you need a specific case setup?" |
+   | PR diff spans both agent tool files and case-data-reading code (Medchron, Ledger, extraction, `job_meta`, `timelineDocumentIds`) | **low** | Surface to user: "The diff touches both agent tools and case data layers — I can't determine the data requirements automatically. What case setup does this ticket need?" |
+   | PR diff is entirely outside agent tool files (Medchron, Ledger, AI-first pipeline, etc.) | N/A — not exit 3 | Fall through to `create_fresh` |
+
+   For `reuse_existing` (exits 1–3): the executor picks any accessible `deqtest_`-prefixed case at runtime. Do not invent implicit case requirements that neither the ticket nor the PR mentions.
+
+All exits require explicit reasoning in `reuse_reason`. Anything else, `create_fresh` — no user confirmation needed.
 
 ### Virtual case-groups
 
@@ -91,11 +105,16 @@ When the planner detects an irreconcilable conflict, **split the group** — ass
 ## Workflow
 
 1. Read `02-triage.json`. Enumerate every `test_units[]` entry.
-2. For each unit, read each linked ticket's PR diff via `mcp__github__get_pull_request_files`. Walk the diff to identify:
+2. For each unit, read each linked ticket's PR from `artifacts/<run-id>/01-pr-diffs.json` (cached by `linear-fetcher`). Skip entries where `skipped: true`. If a PR is missing from the cache entirely, fall back to `mcp__github__get_pull_request_files` directly. Read both `body` (PR description) and `files[].patch` (diff) to identify:
    - Whether the change is data-free (UI label, CSS, route param wiring) or data-dependent (touches code that reads timeline events, citations, document data, ledger entries, etc.).
    - The minimal **event-type set** the test will need to observe (e.g. PR touches Show More on the per-file timeline → needs ≥1 fixture producing medical_record events; PR touches AI Ledger row sorting → needs ≥1 fixture producing medical_bill + treatment events).
    - Whether the scenario requires a **transient case state** (`extracting`, `processing`, etc.) — if so, force `create_fresh` regardless of other signals; transient states aren't reproducible on aged cases.
-3. Decide `case_decision` per unit per the Hard Rules.
+   - **Firm-level connector dependency** (signals: `firmGated`, `connector_type`, `PMS`, `SmokeballDirect`, `Clio`, `CasePeer`, `SmartAdvocate`, `GrowPath`, or any named third-party connector in the AC/PR). If present: read `context/test-accounts/prod-external.md`. If none of the available accounts has that connector configured, set `case_decision: blocked_no_fixture` immediately with a `fixture_gap` naming the required connector — do not wait for the user to surface this at spec time.
+3. Decide `case_decision` per unit per the Hard Rules. For each unit, determine the confidence level:
+   - **High confidence** (any exit, clearly satisfied): proceed without asking the user.
+   - **Medium confidence** (exit 2 or 3 with ambiguous signals): write `02b-data-plan.json` with a `user_review` entry for that unit, then **stop and ask the user** before continuing. Format: "I'm planning to reuse an existing deqtest_ case for unit-X — the diff looks case-agnostic. Does that work, or is there a specific case setup needed?"
+   - **Low confidence** (exit 3, diff spans tool + case-data layers): write nothing yet, **stop and ask the user** immediately. Format: "The diff for unit-X touches both agent tool code and case data layers. I can't determine the data requirements automatically — what case setup does this need?"
+   After the user responds, resume from step 3 for the affected units.
 4. For `create_fresh` units, look up fixtures in `fixtures/manifest.json` by `covers_event_types`. If a needed name is missing, run the Drive auto-search and append to manifest.
 5. Compute case-groups: group `create_fresh` units that have the same `case_kind` and a compatible fixture-set union. Default to the union of all fixtures across the group; trim only if the union exceeds /create-case's max-fixtures cap (currently 6 per the manifest).
 6. Write `02b-data-plan.json` per the schema.
@@ -148,3 +167,4 @@ When the planner detects an irreconcilable conflict, **split the group** — ass
 - ❌ Picking fixtures by file size or page count as a proxy for event richness. Use `covers_event_types`. The manifest is the contract.
 - ❌ Skipping the Drive auto-search and marking a unit as `blocked_no_fixture` just because the manifest doesn't have an entry yet. The Drive folder is the source of truth; the manifest is a cache. Refresh the cache, then proceed.
 - ❌ Inferring data preconditions from the ticket title or description alone. The PR diff is the source of truth. If a ticket title says "Timeline log Show More" but the diff exclusively touches the per-file FileEventApprove sidebar (as OPX-1420 did), plan against the diff's surface.
+- ❌ Applying Hard Rule 3 when the diff touches any code path that reads `job_meta`, `timelineDocumentIds`, extraction status, Medchron events, Ledger entries, or AI-first pipeline gating — those surfaces have implicit case-data requirements even if the ticket prose doesn't mention them. Rule 3 is for modules that treat the case as a neutral container (email, task, note, connector tools); if the feature under test actually cares what is inside the case, infer the data requirements from the diff and default to `create_fresh`.

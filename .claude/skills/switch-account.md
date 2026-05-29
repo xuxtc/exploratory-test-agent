@@ -1,6 +1,6 @@
 ---
 name: switch-account
-description: Log out of the current Supio Portal account and log in as a different role (internal or external), then restore the active run's localStorage feature-flag overrides on the new session. Uses the avatar-menu Log out button — fast and reliable when driven directly. Usage `/switch-account --role internal|external [--env prod|stg]`.
+description: Log out of the current Supio Portal account and log in as a different role (internal or external), then restore the active run's localStorage feature-flag overrides on the new session. Uses the avatar-menu Log out button — fast and reliable when driven directly. Usage `/switch-account --role internal|external [--tag <tag>] [--env prod|stg|prod-ca]`.
 ---
 
 # /switch-account
@@ -28,18 +28,33 @@ Together these mean the only way to clear `id` is to ask the server to clear it,
 ## Args
 
 - `--role <internal|external>` — required. The role to log in as.
-- `--env <prod|stg>` — optional. Defaults to the `default_env` field in `.claude/test-env.local.json`.
+- `--tag <tag>` — optional. Filter to accounts with this tag (e.g. `teams`, `connectors`, `ghostpractice`). When omitted, uses the first account for the role.
+- `--env <prod|stg|prod-ca>` — optional. Defaults to the current run's env.
+- `--session <session_id>` — **required in practice**. The chrome-proxy session to operate on. The orchestrator MUST always pass this explicitly as the unit's `unit_id` (e.g. `"unit-1"`). Do NOT default to `"default"` in a live run — omitting this arg is a bug, not a convenience. Each distinct `session_id` spawns a separate OS-level Chrome browser window; using a different value mid-run leaks a browser process that is never cleaned up and causes subsequent `take_screenshot` timeouts.
+
+## Config file mapping
+
+| `--env` value | Config file |
+|---|---|
+| `stg` | `config/env.stg.json` |
+| `prod` | `config/env.prod.json` |
+| `prod-ca` | `config/env.ca.json` |
 
 ## Inputs you read
 
-- `.claude/test-env.local.json` — credentials for the target role+env. If creds are `null` for the requested combo, abort with a clear message.
+- The relevant `config/env.<env>.json` — credentials for the target role+env+tag.
 - `localStorage.enabledFeatureFlags` and `localStorage.knownBackendFlags` on the current page — the run's flag overrides, snapshotted *before* logout so they survive the logout/login cycle.
 
 ## Workflow
 
-1. **Resolve env + creds.** Read `.claude/test-env.local.json`. If `--env` was passed, use it; otherwise use `default_env`. Look up `environments[<env>].accounts[<role>]`. If `username` or `password` is `null`, abort with:
+1. **Resolve env + creds.**
+   - Determine config file from env (see table above).
+   - Read `accounts[<role>]` array.
+   - If `--tag` was passed, filter to accounts whose `tags` array includes that tag. Use the first match.
+   - If no match found, abort with:
    ```
-   Cannot switch to <role> on <env>: credentials are null in test-env.local.json. Either provision the account or pick a different env.
+   Cannot switch to <role>[tag=<tag>] on <env>: no matching account in config/env.<env>.json.
+   Either provision the account or pick a different tag.
    ```
 
 2. **Snapshot the run's localStorage flag overrides.** Run via `evaluate_script`:
@@ -112,12 +127,22 @@ Together these mean the only way to clear `id` is to ask the server to clear it,
    wait_for [<same landing-page texts as step 7>] timeout=30000
    ```
 
-10. **Return a structured result.**
+10. **Write trace events.** Append the following entries to `trace.jsonl` (same format as the executor runbook's Category A entries):
+
+    ```json
+    {"ts":"<ISO-8601>","event":"logout_start","detail":"switching from <from_email> to <role>[tag=<tag>]"}
+    {"ts":"<ISO-8601>","event":"login_start","detail":"new_login"}
+    {"ts":"<ISO-8601>","event":"login_end","detail":"<target_email>"}
+    ```
+
+    Write `logout_start` immediately before clicking the avatar (step 3). Write `login_start` immediately after the login page appears (step 5 resolves). Write `login_end` after the post-login landing page is confirmed (step 7 resolves).
+
+11. **Return a structured result.**
     ```json
     {
       "ok": true,
       "role": "<internal|external>",
-      "env": "<prod|stg>",
+      "env": "<prod|stg|prod-ca>",
       "account_email": "<email>",
       "ff_restored": true,
       "approx_seconds": 8
@@ -131,13 +156,15 @@ Together these mean the only way to clear `id` is to ask the server to clear it,
 - **Never call `localStorage.clear()` or `sessionStorage.clear()`.** Those would erase the flag snapshot you just took. The avatar-menu Log out preserves localStorage — that's why this skill works.
 - **Snapshot localStorage BEFORE the menu click, not after.** A few rare bug paths in the Portal may clear localStorage on logout. Capturing first guarantees we have the values to restore.
 - **The skill assumes chrome-devtools MCP tools are already loaded in the calling session.** It does not call `ToolSearch` itself — that's the orchestrator's responsibility (per Phase 5a of `/test-tickets`). If the tools aren't loaded, the first `evaluate_script` call will fail with "tool not available" and the skill must surface that as the error.
+- **Every `mcp__chrome-devtools__*` call in this skill must include `session_id: "<unit_id>"`.** The value comes from the `--session` arg passed by the orchestrator. **If `--session` was omitted by the caller, do NOT fall back to `"default"` — abort immediately** with: `switch-account aborted: --session not provided. The orchestrator must pass --session <unit_id> explicitly. Using a different session_id spawns a new Chrome browser window and causes screenshot timeouts.`
 - **Do not navigate to `/logout` as a route.** Empirically the Portal redirects `/logout` back to `/` with the session intact, so it doesn't actually log you out. The avatar menu's Log out button is the only path that fires the actual logout request to `api.supio.com`.
+- **Never open a new Chrome browser window during account switching.** This skill operates entirely within the existing Chrome session passed via `--session`. It does not call `new_page` to create a new browser context, and does not use a different `session_id` at any point. Logout → login happen in the same browser window, on the same page. If you feel the urge to open a new page "to be safe", stop — that is exactly what causes stray browser windows to accumulate on the operator's machine.
 
 ## When NOT to use this skill
 
 - **Cross-env switching** (prod → stg or vice versa). This skill switches *role* within an env, not env. Cross-env requires re-pointing at the other host's `/login` page and is out of scope here.
 - **Logging in fresh from a no-session state.** If the browser has no `id` cookie at start, the avatar won't be there to click — you're already on `/login`. In that case skip to step 6 directly using the calling agent's normal login flow; this skill isn't designed for that path.
-- **Switching between two external accounts.** This skill is keyed on `internal` vs `external` per `test-env.local.json`. If you need to switch between two different external accounts, extend the schema to support named accounts within a role and update this skill.
+- **Switching between two external accounts.** This skill is keyed on `internal` vs `external` per `env.stg.json` / `env.prod.json`. If you need to switch between two different external accounts, extend the schema to support named accounts within a role and update this skill.
 
 ## Anti-patterns
 
