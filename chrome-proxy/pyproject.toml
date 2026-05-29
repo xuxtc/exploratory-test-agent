@@ -1,0 +1,10 @@
+[project]
+name = "chrome-devtools-proxy"
+version = "0.1.0"
+description = "MCP proxy that multiplexes chrome-devtools-mcp across isolated Chrome sessions"
+requires-python = ">=3.11"
+dependencies = ["aiohttp>=3.9"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

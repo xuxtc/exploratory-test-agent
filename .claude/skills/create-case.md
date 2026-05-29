@@ -1,6 +1,6 @@
 ---
 name: create-case
-description: Create a new test case in the Supio prod test tenant via the /create-case UI, with sensible defaults for fixture files, case type, and other form fields. Usage `/create-case [case-name]`. Drives the browser via Chrome DevTools MCP. Default fixtures are pulled from the team Drive cache so no human intervention is needed for the common path.
+description: Create a new test case in the Supio prod/stg portal via the /create-case UI, with fixture file upload. Supports local files (default) or connector source. Usage: /create-case [case-name] [--type <case-type>] [--env prod|stg] [--files <f1.pdf,f2.pdf>] [--connector <name>]. Drives the browser via Chrome DevTools MCP using upload_file for file upload.
 ---
 
 # /create-case
@@ -59,20 +59,74 @@ Before any browser action:
 
    If a fixture isn't in cache, the script downloads it from Drive into `fixtures/cache/<name>.pdf`. The script's stdout is one line of JSON; parse it. On `ok: false` with `stage: download_returned_non_pdf`, fall back to asking the user to drop the PDF into `fixtures/cache/` manually, then retry. **Don't try to scrape Drive's UI yourself — the script handles that path or fails clearly.**
 
+## File upload — `upload_file` via CDP (the ONLY allowed method)
+
+> **STOP. READ THIS BEFORE ANY FILE UPLOAD ACTION.**
+> The one and only allowed upload method is `mcp__chrome-devtools__upload_file` after unhiding the Uppy input.
+> Do NOT use DragEvent simulation, base64 injection, or any local HTTP server — those approaches
+> are unreliable in the VSCode extension environment and have been retired.
+
+The portal uses Uppy with a hidden `<input type="file" class="uppy-DragDrop-input">`. The `upload_file` tool uses Playwright's `handle.uploadFile()` which goes through CDP's `DOM.setFileInputFiles` — this bypasses the OS native file picker entirely, sets files directly on the element, and triggers Uppy's internal `change` handler automatically. No browser security restrictions apply.
+
+**The input is `hidden` by default and does not appear in the a11y snapshot.** Unhide it first so it gets a uid, then call `upload_file` once per fixture:
+
+```js
+// Step 1 — unhide the input (evaluate_script):
+() => {
+  const input = document.querySelector('.uppy-DragDrop-input');
+  input.removeAttribute('hidden');
+  input.style.cssText = 'display:block;position:static;width:1px;height:1px;';
+  return { done: true };
+}
+```
+
+```
+// Step 2 — take_snapshot to get the uid of the now-visible input
+// It appears as: button "Choose Files" value="No file chosen"
+```
+
+```
+// Step 3 — upload_file once per fixture (uid stays stable across uploads):
+mcp__chrome-devtools__upload_file(uid="<uid>", filePath="<absolute-path-to-fixture>")
+```
+
+Repeat Step 3 for each fixture. After each `upload_file` call, the file immediately appears in Uppy's file list with its correct name and size. No `change` event dispatch needed — Playwright handles this internally.
+
+**After all fixtures are uploaded**, verify via snapshot or screenshot that the file list shows the expected count and sizes, and that **Total: N files** matches.
+
 ## Workflow
 
 1. **Announce**: `Creating case "<resolved-case-name>" with fixtures [<list>] (type=<type>, no connector).`
-2. Navigate: `mcp__chrome-devtools__navigate_page` to `https://portal.supio.com/create-case`.
-3. `wait_for(["Case name", "Connector"], timeout=15000)` so the form has hydrated.
-4. Take a snapshot. Click **No connector** and **Upload from my computer** radios. (Use `evaluate_script` to click radios by `value="manual"` / by label text "No connector" — Ant Design's radio uids change between snapshots.)
-5. Fill **Case name** with the resolved name. Use `mcp__chrome-devtools__fill` against the textbox uid from the latest snapshot.
-6. Open the **Case type** combobox, type the case type (default `MVA`), press Enter to commit.
-7. For each resolved fixture path, call `mcp__chrome-devtools__upload_file` against the drop-zone button uid. The form supports calling `upload_file` once per file — multiple PDFs append to the staged list.
-8. Snapshot to confirm: every fixture name appears in the staged file list with the expected size; "Total: N files" matches.
-9. Click **Create case**. The button is enabled when Case name + Case type are set and at least one file is staged.
-10. `wait_for(["Uploading", "Case created", "Case Activity", "Overview"], timeout=30000)`.
-11. After upload completes, the URL becomes `/timeline/<case-id>?t=overview`. Capture `<case-id>` from the URL — that is the value the rest of the spec (and any localStorage key like `aiTimelinePanelClosedInDoneState_<case-id>`) needs.
-12. Return a one-line summary to the orchestrator: `Created case <case-id> "<case-name>" with N fixtures. Pipeline starting; status will transition empty → extracting within ~30s.`
+2. Ensure fixture files are cached: `scripts/get-fixture.py --name "<fixture-name>"` for each.
+3. Navigate to `https://portal.supio.com/create-case`. Confirm page load via `take_snapshot` (look for "Drop here" in the drop zone button text).
+4. Fill **Case name** via React native setter:
+   ```js
+   () => {
+     const input = document.querySelector('#caseName');
+     Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, '<name>');
+     input.dispatchEvent(new Event('input', { bubbles: true }));
+   }
+   ```
+5. Set **Case type** by typing into `#caseType`, then clicking the matching `.ant-select-item-option` (the option list appears after typing).
+6. **Upload fixtures** (see section above):
+   - `evaluate_script` to unhide `.uppy-DragDrop-input`.
+   - `take_snapshot` to get the input's uid (shows as `button "Choose Files"`).
+   - `upload_file(uid, filePath)` once per fixture — the uid remains stable across all uploads.
+   - After all uploads, take a screenshot to confirm files appear in the list with correct filenames and sizes.
+7. Click **Create case** via `evaluate_script`:
+   ```js
+   () => Array.from(document.querySelectorAll('button')).find(b => b.textContent?.trim() === 'Create case')?.click();
+   ```
+8. Poll `location.href` until it leaves `/create-case`. Then find the case ID:
+   ```js
+   async () => {
+     const r = await fetch('https://api.supio.com/api/v1/cases/search?limit=1&q=<case-name>', { credentials: 'include' });
+     return (await r.json())?.list?.[0]?.id;
+   }
+   ```
+9. Navigate to `https://portal.supio.com/cases/<case-id>/events`. Wait for files to appear in CASE FILES sidebar.
+10. Navigate to `/cases/<id>/medical-chronology`. Wait for extracted events or a **"View N new files"** button to appear. If "No events found" and files are in CASE FILES sidebar: yield via `ScheduleWakeup` for 90s and re-poll; cap at 20 min. Do NOT check the Events tab (`/cases/<id>/events`) — that shows case-level events, not extraction results. Do NOT use `/api/v1/cases/<id>/event-count` — always returns 0. (The Overview tab has been removed.)
+11. Return: `Created case <case-id> "<case-name>" with N fixtures. Extraction status: <complete|in_progress|unknown>.`
 
 ## Hard rules
 
@@ -84,8 +138,13 @@ Before any browser action:
 
 ## Anti-patterns
 
+- ❌ **DragEvent simulation** — previously used but retired. It relied on a local HTTP CORS server (`http://localhost:8765`) which is blocked by Mixed Content policy when the portal runs on HTTPS in the VSCode extension environment. Do not resurrect this approach.
+- ❌ **Base64 injection via `evaluate_script`** — the 1–4 MB base64 strings for real fixture PDFs exceed the MCP tool call payload limit. Not viable.
+- ❌ **Local CORS server** (`python3 /tmp/cors_server.py`) — no longer needed. Do not start one.
+- ❌ Calling `upload_file` without unhiding the input first — the hidden input has no uid in the snapshot and the call will fail with "element not found".
+- ❌ Calling `upload_file` with a path outside the workspace roots — the MCP server rejects paths under `~/Downloads`, `/tmp`, `~/Desktop`, etc. Fixture files must be under the project directory (`exploratory-test-agent/fixtures/cache/`).
+- ❌ `Object.defineProperty(input, 'files', ...)` + manual `change` event — the files are empty at the time the event fires (CDP hasn't written them yet). Use `upload_file` instead.
 - ❌ Reading the Drive folder's HTML / a11y tree to enumerate files — that path is fragile, virtualized, and language-locale-dependent. Use the manifest.
-- ❌ Calling `upload_file` with a path outside the workspace root (Chrome DevTools MCP will refuse).
 - ❌ Falling back to "any PDF will do" if a manifest fixture isn't downloadable — the AI-first pipeline needs real medical-shaped content to produce non-empty `timelineDocumentIds[]`. A junk PDF will give you a case stuck at `status: 'empty'` and no panel.
 - ❌ Filling Case ID under the No-connector path. That field is hidden by the form when `connector === none`; trying to interact with it crashes the snapshot.
 

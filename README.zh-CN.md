@@ -25,7 +25,7 @@
 
 1. **Agent 看着页面**（DOM snapshot + 截图）即时决定下一次点哪里。运行时吸收 UI 差异，远比事先把它编码下来要省事。
 2. **Agent 在写测试场景前会读关联 PR 的 diff**（通过 GitHub MCP）。它测的是 PR **真正发布出来的东西**，而不是工单文本里许诺的东西。
-3. **Playwright 是产物，不是运行时。** 一次运行只有在所有主场景都通过后，才会把成功的 trace 翻译成 `.spec.ts`。失败的运行只产出截图、结果和工单评论，**不**产出 spec —— 因为一份坏掉的录像比没有录像更糟。
+3. **trace 才是产物。** 一次运行会产出 `trace.jsonl`，记录每一步的执行细节。portal 的 `add-test` 流水线读取 trace（结合 Requirement Spec）来生成 Page Object 风格的 Playwright 代码 —— 不需要中间的 `.spec.ts` 翻译层。
 
 ---
 
@@ -44,7 +44,7 @@
                                                               generated.spec.ts（仅在 PASS 时产出）
                                                                             │
                                                               可选、手动：
-                                                              /archive-to-portal ──▶ <your-playwright-repo> 分支
+                                                              /archive-to-portal ──▶ portal/.claude/incoming/
 ```
 
 ### Agent 角色
@@ -55,9 +55,8 @@
 | `test-triage` | 决定每个工单要不要测；把工单聚成单元；推断用户角色 | `01-fetch.json` | `02-triage.json` |
 | `test-data-planner` | 决定每个单元是新建 case 还是复用 case；按 event-type 覆盖度选 fixture；必要时通过 Drive 搜索补全 manifest | `02-triage.json`、GitHub MCP、`fixtures/manifest.json` | `02b-data-plan.json` |
 | `test-strategist` | 读关联 PR 的 diff；执行三轮 gate 扫描（直接 flag 引用 → MobX/store getter 包装 → lazy import）将每个 gate 归类为 feature flag 或 data gate；写一份基于"实际发布代码"的 Requirement Spec；把 data_setup 绑到 data plan | `02b-data-plan.json`、GitHub MCP | `03-spec-<unit>.md` 加 `.json` 副本 |
-| `test-executor` | 一步步驱动 Chrome；记录每一个动作；评估每个 Then。**这是 in-context runbook，不是 sub-agent** —— 由 orchestrator 在主会话中执行，因为 Chrome DevTools MCP 工具是 deferred 的，不会传递给 spawn 出来的子 agent。 | `03-spec-<unit>.json`、`02b-data-plan.json`、Chrome DevTools MCP | `trace.jsonl`、`screenshots/`、`result.json`、`generated.spec.ts` |
-| `linear-reporter` | 在每个工单上发评论，附结果和截图。每次构建评论前读取 `prompts/linear-comment-template.md` 以保证格式一致。两种模式：per-unit（一个单元跑完就发一条）和聚合（运行结束时写 `05-summary.md`） | `result.json`、`prompts/linear-comment-template.md` | 工单评论 + `05-summary.md` |
-| `portal-archiver` | （手动触发）把 `generated.spec.ts` 适配进你的 Playwright 仓库的目录约定，落到一个分支上 | `generated.spec.ts` | `<your-playwright-repo>` 上的分支 |
+| `test-executor` | 一步步驱动 Chrome；记录每一个动作；评估每个 Then。**In-context runbook**（`.claude/runbooks/test-executor.md`），不是 sub-agent —— 由 orchestrator 在主会话中执行，因为 Chrome DevTools MCP 工具是 deferred 的，不会传递给 spawn 出来的子 agent。 | `03-spec-<unit>.json`、`02b-data-plan.json`、Chrome DevTools MCP | `trace.jsonl`、`screenshots/`、`result.json`、`generated.spec.ts` |
+| `linear-reporter` | 在每个工单上发评论，附结果和截图。每次构建评论前读取 `prompts/linear-comment-template.md` 以保证格式一致。两种模式：per-unit（一个单元跑完就发一条）和聚合（运行结束时写 `05-summary.md`）。**In-context runbook**（`.claude/runbooks/linear-reporter.md`），不是 sub-agent。 | `result.json`、`prompts/linear-comment-template.md` | 工单评论 + `05-summary.md` |
 
 ### 置信度门控
 
@@ -77,8 +76,7 @@ artifacts/<run-id>/
 ├── 04-run-<unit>/
 │   ├── trace.jsonl             # 每一步一条 JSON（schema 校验）
 │   ├── screenshots/            # 每个 checkpoint 和每次失败的 PNG
-│   ├── result.json             # 每个场景的 pass/fail（schema 校验）
-│   └── generated.spec.ts       # Playwright 翻译，仅在 PASS 时产出
+│   └── result.json             # 每个场景的 pass/fail（schema 校验）
 ├── case-group-<N>/
 │   └── case_id.txt             # 该组 executor 创建/复用的 case；同组兄弟单元会复用它
 └── 05-summary.md               # 整次运行的最终汇总
@@ -88,7 +86,23 @@ Schema 在 [`schemas/`](./schemas/) 下；校验器是 `scripts/validate-artifac
 
 ### Review 后再归档
 
-`<your-playwright-repo>`（正式回归套件）保持干净：除非你显式运行 `/archive-to-portal` 并 review 了 diff，否则什么都不会落进去。本仓库**永远不会主动 push 到那里**。
+`<your-playwright-repo>`（正式回归套件）保持干净：除非你显式运行 `/archive-to-portal`，否则什么都不会落进去。该命令只把 `03-spec.md` + `trace.jsonl` 复制到 `.claude/incoming/`；portal 那边的 `add-test` 流水线再根据这两份文件生成真正的 Playwright 代码。本仓库**永远不会主动 push 到 portal 仓库**。
+
+### 并行 Chrome Session
+
+`chrome-proxy/proxy_server.py` 是一个 MCP proxy，架在 `chrome-devtools-mcp` 前面，将其多路复用到多个独立的 Chrome 实例。每次工具调用都可以带一个可选的 `session_id` 参数；不同 `session_id` 的调用会被路由到各自独立的 Chrome 进程，每个进程有独立的 `--userDataDir`，因此登录态、cookie、localStorage 完全隔离。
+
+这意味着可以同时针对不同账号或不同环境并行跑测试，session 之间互不干扰：
+
+```
+session-prod-internal  →  Chrome A（prod，internal 账号）
+session-prod-external  →  Chrome B（prod，external 账号）
+session-prod-ca        →  Chrome C（ca-portal，CA 账号）
+```
+
+不传 `session_id`（或传 `"default"`）时，proxy 行为等同于单 session 的 `chrome-devtools-mcp`，完全向后兼容。
+
+proxy 在 `.mcp.json` 中配置，随 Claude Code 自动启动。超过 5 分钟没有工具调用的 session 会被自动清理。
 
 ### 凭证不出本地
 
@@ -127,15 +141,57 @@ Schema 在 [`schemas/`](./schemas/) 下；校验器是 `scripts/validate-artifac
 
 打开 `artifacts/<run-id>/` —— 所有产物都是纯 JSON 或 markdown。工单评论里会回链到它。
 
+### 同步测试场景到用例库
+
+测试通过后，把本次执行的场景写入 Google Sheets 测试用例库：
+
+```
+> /sync-test-cases 2026-05-07_1430_LIN-123
+```
+
+读取 `result.json` + `03-spec` 副本，构建结构化测试用例（Given/When/Then），展示差异预览（NEW / UPDATE / SKIP），确认后写入。只接受 `passed_primary: true` 的运行结果。
+
+---
+
 ### 归档一个通过的测试
 
-review 完 `generated.spec.ts` 之后：
+测试通过后，你可以把这次跑通的 spec 推进正式的 Playwright 回归套件。整个流程分两步：
+
+**第一步 —— 把 spec 交接过去（在本仓库操作）**
+
+直接说工单号，Agent 会自动找到对应的 run：
+
+```
+> 把 LIN-123 推给 playwright
+```
+
+或者指定完整的 run-id/unit：
 
 ```
 > /archive-to-portal 2026-05-07_1430_LIN-123/unit-1
 ```
 
-会按你的 Playwright 仓库的目录结构（pages/、fixtures、命名约定）适配 spec，并创建一个分支。**它不会 push** —— 你自己 review diff 然后 `git push`。
+以下自然语言说法效果完全一样：
+- `推送 LIN-123 到 playwright`
+- `把 LIN-123 归档到 playwright`
+- `archive LIN-123 to portal`
+- `ship LIN-123 to playwright`
+- `automation LIN-123`
+- `自动化 LIN-123`
+
+执行效果：把 `03-spec-unit-1.md` 和 `trace.jsonl` 复制到 `$PLAYWRIGHT_REPO_PATH/.claude/incoming/` 目录。**此时 Playwright 仓库里还没有写入任何代码。** 如果这个工单有多个 unit，Agent 会让你选择归档哪一个。
+
+**第二步 —— 生成 Page Object 代码（在你的 Playwright 仓库操作）**
+
+切到 Playwright 仓库，执行：
+
+```
+> /add-test
+```
+
+或者说：`把推过来的场景形成用例`
+
+`add-test` 流水线会读取 incoming 目录里的 spec，对照真实应用校验选择器，然后按照该仓库的目录约定（`pages/`、`fixtures/`、命名规则）生成符合现有套件风格的 Page Object 代码。**不会自动 push** —— 你自己 review diff 再 `git push`。
 
 ---
 
@@ -143,11 +199,15 @@ review 完 `generated.spec.ts` 之后：
 
 ```
 .claude/
-  agents/                # 每个 sub-agent 一个 .md —— 这就是它们的 prompt
-  skills/                # /test-tickets、/create-case、/switch-account、/toggle-feature-flag、/archive-to-portal、/retro
+  agents/                # 仅包含真正的 sub-agent：linear-fetcher、test-triage、test-data-planner、test-strategist
+  runbooks/              # in-context runbook：test-executor、linear-reporter（由 orchestrator 读取执行，不 spawn）
+  skills/                # /test-tickets、/archive-to-portal、/sync-test-cases、/create-case、/switch-account、/toggle-feature-flag、/retro
   settings.json          # 入库：权限白名单、MCP servers
   settings.local.json    # gitignored：个人路径、密钥
-  test-env.local.json    # gitignored：测试租户凭证
+  # 测试凭证现在位于 config/env.stg.json、env.prod.json、env.ca.json（仓库根目录）
+chrome-proxy/
+  proxy_server.py        # MCP proxy：将 chrome-devtools-mcp 多路复用到多个隔离 Chrome 实例（每个 session_id 一个）
+  pyproject.toml
 artifacts/               # gitignored：每次运行的产物
 fixtures/
   manifest.json          # 入库：fixture 名 → Drive file id 映射
@@ -175,7 +235,7 @@ CLAUDE.md                # 每次会话 agent 都会读的运行手册
 - **默认用全新测试数据。** 如果单元需要特定的数据形态，planner 会带着合适的 fixture 新建一个 case，而不是去现有 case 池里翻找。只有当用户/spec 显式指定了某个 case，或者改动本身和数据无关时，才复用。
 - **Spec 以 PR diff 为准，不以工单文本为准。** 当工单承诺 X 但 PR 没有发布 X，那是 Open question，不是测试场景。
 - **场景执行中不许 reload，除非 spec 显式要求。** Reload 会抹掉"应该实时更新但没更新"的证据；这一类 bug 需要先有一次"不刷新就观察"的确认。
-- **测试租户之外不允许任何 production 写入。** 在 `test-env.local.json` 里按环境配置。
+- **测试租户之外不允许任何 production 写入。** 凭证按环境配置在 `config/env.prod.json` 和 `config/env.ca.json` 中。
 - **Feature flag 和 data gate 要明确区分，不能靠猜。** strategist 对每个关联 PR diff 执行三轮扫描，区分 localStorage override 类 flag（由 `/toggle-feature-flag` 处理）和 `job_meta.ai_first` 这类 data gate（由创建 case 时的类型决定）。把两者混淆会导致测试静默失败。
 - **工单系统里的关系字段是工单 owner 的事。** 本 Agent 只发评论，仅此而已 —— 永远不动 `relatedTo` / `blocks` / `parentId`。某些工单系统（如 Linear）会自动从评论正文里的工单 ID 文本生成 "related issue" 反向链接，所以跨工单的 workflow 上下文只放在本地 `05-summary.md` 里，永远不写进评论。
 
